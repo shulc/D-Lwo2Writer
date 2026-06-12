@@ -1,0 +1,10 @@
+.dub/
+lib/
+*.o
+*.obj
+*.lib
+*.a
+*.exe
+dub.selections.json
+__test__*__
+examples/*/convert

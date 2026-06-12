@@ -1,0 +1,12 @@
+{
+    "name": "convert",
+    "description": "Import any assimp-supported model and save it as LWO2.",
+    "targetType": "executable",
+    "dependencies": {
+        "lwo2-writer":    { "path": "../.." },
+        "bindbc-assimp6": { "path": "../../../D-Assimp" }
+    },
+    "subConfigurations": {
+        "lwo2-writer": "full"
+    }
+}

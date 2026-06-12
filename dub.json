@@ -1,0 +1,27 @@
+{
+    "name": "lwo2-writer",
+    "description": "Minimal LWO2 (LightWave object) writer for D, with an optional assimp (bindbc-assimp6) adapter.",
+    "license": "MIT",
+    "authors": ["Alexander Shagarov"],
+
+    "targetType": "library",
+    "targetPath": "lib",
+
+    "sourcePaths": ["source"],
+    "importPaths": ["source"],
+
+    "configurations": [
+        {
+            "name": "full",
+            "comment": "Writer + aiScene* adapter (lwo2.assimp). Pulls in bindbc-assimp6.",
+            "dependencies": {
+                "bindbc-assimp6": { "path": "../D-Assimp" }
+            }
+        },
+        {
+            "name": "core",
+            "comment": "Dependency-free writer only; excludes the assimp adapter.",
+            "excludedSourceFiles": ["source/lwo2/assimp.d"]
+        }
+    ]
+}

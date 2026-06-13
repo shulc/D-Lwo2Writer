@@ -23,14 +23,20 @@ FORM .. LWO2
   TAGS            surface name table
   PNTS            float32 BE x/y/z per point
   BBOX            bounding box
+  VMAP .. (xN)    continuous per-point vertex maps (e.g. UV / TXUV)
   POLS FACE       ordinary polygons
+  VMAD .. (xN)    per-corner maps bound to the FACE polys above
   POLS PTCH       Catmull-Clark subpatches (emitted only if any)
+  VMAD .. (xN)    per-corner maps bound to the PTCH polys above
   PTAG SURF       polygon -> surface tag
   SURF .. (xN)    COLR / DIFF / SPEC / GLOS / TRAN
 ```
 
-Not yet emitted: UV/weight maps (VMAP), per-corner discontinuities (VMAD),
-image clips (CLIP), bones.
+A VMAD binds to the most-recent `POLS` chunk and uses POLS-local poly indices,
+so each `VMAD` is emitted immediately after the `POLS` chunk of the kind it
+references.
+
+Not yet emitted: image clips (CLIP), bones.
 
 ## Usage — core writer (no dependencies)
 

@@ -416,3 +416,167 @@ unittest
     assert(back.polygons.length == 2);
     assert(back.polygons[1].subpatch);
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3 — UV write: VMAP + VMAD are emitted, structurally valid, and the
+// VMAD poly VX is the POLS-LOCAL index.
+//
+// The mesh has one FACE quad (obj.polygons[0]) and one PTCH tri
+// (obj.polygons[1]). A continuous TXUV VMAP names two points; a discontinuous
+// TXUV VMAD attaches a per-corner UV to the PTCH poly (obj.polygons[1]). Since
+// the PTCH poly is the first (and only) poly in the PTCH POLS chunk, its
+// POLS-LOCAL index is 0 — NOT its obj.polygons[] index 1. The on-disk VMAD poly
+// VX must therefore be 0, the load-bearing D-2 remap proof.
+//
+// The full write->read round-trip lands in Stage 4 (reader not done yet); this
+// stage asserts the EMITTED bytes structurally.
+// ---------------------------------------------------------------------------
+unittest
+{
+    Lwo2Object obj;
+    obj.points = [
+        [0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f], [0.5f, 2f, 0f]
+    ];
+    obj.surfaces = [
+        Lwo2Surface("Body"),
+        Lwo2Surface("Roof"),
+    ];
+    obj.polygons = [
+        Lwo2Polygon([0, 1, 2, 3], 0, false), // FACE — local index 0 in POLS#1
+        Lwo2Polygon([3, 2, 4],    1, true),  // PTCH — local index 0 in POLS#2
+    ];
+
+    // Continuous per-point UV: two named points.
+    Lwo2VertexMap vm;
+    vm.type      = "TXUV";
+    vm.name      = "Texture";
+    vm.dimension = 2;
+    vm.points    = [0u, 3u];
+    vm.values    = [0.0f, 0.0f,  1.0f, 0.5f];
+    obj.vmaps ~= vm;
+
+    // Discontinuous per-corner UV on the PTCH poly (obj.polygons[] index 1).
+    Lwo2VertexMapD vmad;
+    vmad.type      = "TXUV";
+    vmad.name      = "Texture";
+    vmad.dimension = 2;
+    vmad.points    = [3u];
+    vmad.polys     = [1u];           // obj.polygons[] space; local index is 0
+    vmad.values    = [0.25f, 0.75f];
+    obj.vmads ~= vmad;
+
+    auto bytes = buildLwo2(obj);
+
+    // Well-formed FORM/LWO2 header + FORM length still == len - 8.
+    assert(bytes[0 .. 4] == cast(const(ubyte)[]) "FORM");
+    assert(bytes[8 .. 12] == cast(const(ubyte)[]) "LWO2");
+    uint formLen = (bytes[4] << 24) | (bytes[5] << 16) | (bytes[6] << 8) | bytes[7];
+    assert(formLen == bytes.length - 8, "FORM length wrong after VMAP/VMAD");
+    assert(bytes.length % 2 == 0, "IFF image must be even-length");
+
+    // The new chunks (and their TXUV type) are present.
+    import std.algorithm : canFind;
+    assert(canFind(bytes, cast(const(ubyte)[]) "VMAP"), "VMAP chunk missing");
+    assert(canFind(bytes, cast(const(ubyte)[]) "VMAD"), "VMAD chunk missing");
+    assert(canFind(bytes, cast(const(ubyte)[]) "TXUV"), "TXUV type missing");
+
+    // VMAP body: "TXUV" | U2 dim=2 | S0 "Texture" | (VX 0, F4 0,0) (VX 3, F4 1,0.5)
+    auto vmapBody = chunkBody(bytes, "VMAP");
+    assert(vmapBody !is null, "VMAP body not found");
+    assert(vmapBody[0 .. 4] == cast(const(ubyte)[]) "TXUV", "VMAP type != TXUV");
+    ushort vmapDim = cast(ushort)((vmapBody[4] << 8) | vmapBody[5]);
+    assert(vmapDim == 2, "VMAP dimension should be 2");
+
+    // VMAD body: "TXUV" | U2 dim=2 | S0 "Texture" | (VX point=3, VX localPoly, F4..)
+    auto vmadBody = chunkBody(bytes, "VMAD");
+    assert(vmadBody !is null, "VMAD body not found");
+    assert(vmadBody[0 .. 4] == cast(const(ubyte)[]) "TXUV", "VMAD type != TXUV");
+    ushort vmadDim = cast(ushort)((vmadBody[4] << 8) | vmadBody[5]);
+    assert(vmadDim == 2, "VMAD dimension should be 2");
+    // Skip the S0 name "Texture" (7 chars + NUL = 8, even -> no extra pad).
+    size_t off = 6;
+    while (off < vmadBody.length && vmadBody[off] != 0) off++;
+    off++;                                  // consume NUL
+    if (((off - 6) & 1) != 0) off++;        // S0 even pad (name+NUL odd -> +1)
+    // First entry: VX point (small -> U2), then VX localPoly (small -> U2).
+    ushort vmadPoint = cast(ushort)((vmadBody[off] << 8) | vmadBody[off + 1]);
+    ushort vmadPoly  = cast(ushort)((vmadBody[off + 2] << 8) | vmadBody[off + 3]);
+    assert(vmadPoint == 3, "VMAD point index should be 3");
+    assert(vmadPoly == 0,
+           "VMAD poly VX must be POLS-LOCAL 0 (not obj.polygons[] index 1)");
+
+    // Every top-level chunk has an even on-disk footprint (len + pad).
+    for (size_t p = 12; p + 8 <= bytes.length; )
+    {
+        uint len = (bytes[p + 4] << 24) | (bytes[p + 5] << 16)
+                 | (bytes[p + 6] << 8)  | bytes[p + 7];
+        size_t footprint = 8 + len + (len & 1);
+        assert((footprint & 1) == 0, "chunk footprint must be even");
+        p += footprint;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3 — VMAD emit-order: a FACE-kind VMAD and a PTCH-kind VMAD each land
+// immediately after their own kind's POLS chunk (the per-kind binding rule).
+// Order on disk must be: POLS(FACE), VMAD(FACE), POLS(PTCH), VMAD(PTCH).
+// ---------------------------------------------------------------------------
+unittest
+{
+    Lwo2Object obj;
+    obj.points = [
+        [0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f], [0.5f, 2f, 0f]
+    ];
+    obj.surfaces = [ Lwo2Surface("Body") ];
+    obj.polygons = [
+        Lwo2Polygon([0, 1, 2, 3], 0, false), // FACE
+        Lwo2Polygon([3, 2, 4],    0, true),  // PTCH
+    ];
+
+    Lwo2VertexMapD faceVmad;
+    faceVmad.type = "TXUV"; faceVmad.name = "F"; faceVmad.dimension = 2;
+    faceVmad.points = [0u]; faceVmad.polys = [0u]; faceVmad.values = [0.1f, 0.2f];
+
+    Lwo2VertexMapD ptchVmad;
+    ptchVmad.type = "TXUV"; ptchVmad.name = "P"; ptchVmad.dimension = 2;
+    ptchVmad.points = [4u]; ptchVmad.polys = [1u]; ptchVmad.values = [0.3f, 0.4f];
+
+    obj.vmads = [ faceVmad, ptchVmad ];
+
+    auto bytes = buildLwo2(obj);
+
+    // Collect (id, bodyStart) in disk order.
+    string[] ids;
+    for (size_t p = 12; p + 8 <= bytes.length; )
+    {
+        ids ~= cast(string)(bytes[p .. p + 4].idup);
+        uint len = (bytes[p + 4] << 24) | (bytes[p + 5] << 16)
+                 | (bytes[p + 6] << 8)  | bytes[p + 7];
+        p += 8 + len + (len & 1);
+    }
+
+    // Find each POLS by inspecting its first 4 body bytes (FACE vs PTCH).
+    // Locate ordered indices of POLS-FACE, the first VMAD after it, POLS-PTCH,
+    // and the VMAD after that.
+    import std.algorithm : countUntil;
+    // There are exactly two POLS chunks (FACE then PTCH) and two VMADs.
+    size_t nPols = 0, nVmad = 0;
+    foreach (id; ids) { if (id == "POLS") nPols++; if (id == "VMAD") nVmad++; }
+    assert(nPols == 2, "expected two POLS chunks (FACE + PTCH)");
+    assert(nVmad == 2, "expected two VMAD chunks (one per kind)");
+
+    // Walk in order; the sequence must be POLS, VMAD, POLS, VMAD.
+    string[] geomSeq;
+    foreach (id; ids)
+        if (id == "POLS" || id == "VMAD")
+            geomSeq ~= id;
+    assert(geomSeq == ["POLS", "VMAD", "POLS", "VMAD"],
+           "VMAD must follow its own kind's POLS (POLS,VMAD,POLS,VMAD)");
+
+    // The FACE VMAD's poly VX is local 0 (FACE poly is local 0 in POLS#1);
+    // the PTCH VMAD's poly VX is local 0 (PTCH poly is local 0 in POLS#2).
+    // Both happen to be 0 here, which is exactly the POLS-local property.
+    auto vmadBody = chunkBody(bytes, "VMAD"); // first VMAD = FACE-kind
+    assert(vmadBody !is null);
+    assert(vmadBody[0 .. 4] == cast(const(ubyte)[]) "TXUV");
+}

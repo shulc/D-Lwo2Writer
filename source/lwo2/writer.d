@@ -10,15 +10,22 @@
 ///     TAGS              -- surface name table
 ///     PNTS              -- float32 BE x/y/z per point
 ///     BBOX              -- bounding box
+///     VMAP .. (xN)      -- continuous per-point vertex maps (e.g. UV/TXUV)
 ///     POLS FACE         -- ordinary polygons
+///     VMAD .. (xN)      -- per-corner maps bound to the FACE polys above
 ///     POLS PTCH         -- Catmull-Clark subpatches (only if any)
+///     VMAD .. (xN)      -- per-corner maps bound to the PTCH polys above
 ///     PTAG SURF         -- polygon -> surface tag
 ///     SURF .. (xN)      -- COLR / DIFF / SPEC / GLOS / TRAN
 ///
+/// A VMAD binds to the most-recent POLS chunk and uses POLS-local poly indices,
+/// so each VMAD is emitted immediately after the POLS chunk of the kind it
+/// references (each VMAD references exactly one kind).
+///
 /// The surface model mirrors the fields a LightWave/Modo-style modeller keeps
 /// per material (base color + diffuse/specular/glossiness/opacity), so output
-/// reads back identically through such a loader. Not yet emitted: UVs/weight
-/// maps (VMAP), per-corner discontinuities (VMAD), image clips (CLIP), bones.
+/// reads back identically through such a loader. Not yet emitted: image clips
+/// (CLIP), bones.
 ///
 /// Format reference:
 ///   https://docs.lightwave3d.com/2025/lightwave-object-format.html
@@ -172,6 +179,29 @@ ubyte[] buildLwo2(in Lwo2Object obj)
         putChunk(body_, "BBOX", c.data);
     }
 
+    // --- VMAP: continuous per-point vertex maps ---------------------------
+    // VMAP is per-point and POLS-independent (it carries explicit point
+    // indices), so it can be emitted here, before any POLS chunk. Body layout:
+    //   ID4 type | U2 dimension | S0 name | per entry { VX point | F4 x dim }
+    foreach (vm; obj.vmaps)
+    {
+        assert(vm.type.length == 4, "VMAP type must be a 4-char ID4");
+        assert(vm.values.length == vm.points.length * vm.dimension,
+               "VMAP values length must equal points * dimension");
+        auto c = appender!(ubyte[]);
+        c.put(cast(const(ubyte)[]) vm.type[]);
+        putU2(c, cast(ushort) vm.dimension);
+        putS0(c, vm.name);
+        foreach (k, pt; vm.points)
+        {
+            assert(pt < obj.points.length, "VMAP point index out of range");
+            putVX(c, pt);
+            foreach (d; 0 .. vm.dimension)
+                putF4(c, vm.values[k * vm.dimension + d]);
+        }
+        putChunk(body_, "VMAP", c.data);
+    }
+
     // --- POLS: FACE then PTCH ---------------------------------------------
     // The two poly kinds go into two SEPARATE POLS chunks (FACE then PTCH).
     // `emitOrder` is the flat emission sequence (FACE polys, then PTCH polys),
@@ -186,6 +216,19 @@ ubyte[] buildLwo2(in Lwo2Object obj)
     emitOrder.reserve(obj.polygons.length);
     auto polyToLocal = new uint[obj.polygons.length];
     auto polyIsPtch  = new bool[obj.polygons.length];
+    // Precompute the per-kind POLS-local index + kind for EVERY polygon up
+    // front (one counter per kind), so the VMAD single-kind assert and the
+    // POLS-local remap are valid no matter which pass is running. The emission
+    // loop below reproduces the same numbering as it walks each kind.
+    {
+        uint[2] kindCount = [0u, 0u];
+        foreach (i, poly; obj.polygons)
+        {
+            ubyte k = poly.subpatch ? 1 : 0;
+            polyToLocal[i] = kindCount[k]++;
+            polyIsPtch[i]  = poly.subpatch;
+        }
+    }
     foreach (kind; 0 .. 2)            // 0 = FACE, 1 = PTCH
     {
         bool wantSub = (kind == 1);
@@ -201,8 +244,8 @@ ubyte[] buildLwo2(in Lwo2Object obj)
             putU2(c, cast(ushort)(poly.indices.length & 0x3FF)); // count | flags(0)
             foreach (idx; poly.indices)
                 putVX(c, idx);
-            polyToLocal[i] = local++;
-            polyIsPtch[i]  = wantSub;
+            assert(polyToLocal[i] == local, "POLS-local numbering desync");
+            local++;
             emitOrder ~= i;
         }
         if (emitOrder.length == first)
@@ -212,6 +255,56 @@ ubyte[] buildLwo2(in Lwo2Object obj)
         if (wantSub)
             data[0 .. 4] = cast(const(ubyte)[]) "PTCH"[];
         putChunk(body_, "POLS", data);
+
+        // --- VMAD: discontinuous per-corner maps for THIS kind ------------
+        // A VMAD binds to the most-recent POLS chunk and uses POLS-LOCAL poly
+        // indices, so each VMAD must be emitted immediately after the POLS
+        // chunk of the kind it references. We flush every VMAD whose polys
+        // belong to the kind just written (D-2 single-kind constraint). Body:
+        //   ID4 type | U2 dim | S0 name
+        //     | per entry { VX point | VX localPoly | F4 x dim }
+        // where localPoly = polyToLocal[polys[k]] (public polys[] is
+        // obj.polygons[]-space; remapped to POLS-local on emit).
+        foreach (vmad; obj.vmads)
+        {
+            assert(vmad.type.length == 4, "VMAD type must be a 4-char ID4");
+            assert(vmad.values.length == vmad.points.length * vmad.dimension,
+                   "VMAD values length must equal points * dimension");
+            assert(vmad.polys.length == vmad.points.length,
+                   "VMAD polys length must equal points length");
+            if (vmad.points.length == 0)
+                continue;              // nothing to bind; skip empty VMAD
+
+            // Single-kind assert: every entry's poly must share one kind.
+            bool vmadKind = polyIsPtch[vmad.polys[0]];
+            foreach (pi; vmad.polys)
+            {
+                assert(pi < obj.polygons.length,
+                       "VMAD poly index out of range");
+                assert(polyIsPtch[pi] == vmadKind,
+                       "VMAD spans both FACE and PTCH kinds (single-kind only)");
+            }
+            if (vmadKind != wantSub)
+                continue;              // belongs to the other kind's POLS
+
+            auto c2 = appender!(ubyte[]);
+            c2.put(cast(const(ubyte)[]) vmad.type[]);
+            putU2(c2, cast(ushort) vmad.dimension);
+            putS0(c2, vmad.name);
+            foreach (k; 0 .. vmad.points.length)
+            {
+                uint pt = vmad.points[k];
+                assert(pt < obj.points.length, "VMAD point index out of range");
+                uint localPoly = polyToLocal[vmad.polys[k]];
+                assert(localPoly < local,
+                       "VMAD local poly index exceeds this kind's poly count");
+                putVX(c2, pt);
+                putVX(c2, localPoly);
+                foreach (d; 0 .. vmad.dimension)
+                    putF4(c2, vmad.values[k * vmad.dimension + d]);
+            }
+            putChunk(body_, "VMAD", c2.data);
+        }
     }
 
     // --- PTAG SURF: polygon -> surface tag --------------------------------

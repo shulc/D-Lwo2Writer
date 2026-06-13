@@ -173,15 +173,24 @@ ubyte[] buildLwo2(in Lwo2Object obj)
     }
 
     // --- POLS: FACE then PTCH ---------------------------------------------
-    // Polygon indices used by PTAG run sequentially across the emitted POLS
-    // chunks, so we fix the emission order here (all FACE, then all PTCH) and
-    // reuse it for PTAG below. `emitOrder` holds indices into obj.polygons.
+    // The two poly kinds go into two SEPARATE POLS chunks (FACE then PTCH).
+    // `emitOrder` is the flat emission sequence (FACE polys, then PTCH polys),
+    // reused below for SURF iteration. `polyToLocal[i]` is the POLS-LOCAL index
+    // of polygon `i` within its own POLS chunk: a per-kind counter that resets
+    // to 0 at the start of each kind's pass. Per the LWO2 spec, PTAG poly
+    // indices are local to the most-recent POLS chunk (a conformant reader
+    // resets numbering per POLS), so PTAG must use `polyToLocal`, not the flat
+    // `emitOrder` position. `polyIsPtch[i]` records the kind for downstream
+    // (e.g. VMAD) single-kind handling.
     size_t[] emitOrder;
     emitOrder.reserve(obj.polygons.length);
+    auto polyToLocal = new uint[obj.polygons.length];
+    auto polyIsPtch  = new bool[obj.polygons.length];
     foreach (kind; 0 .. 2)            // 0 = FACE, 1 = PTCH
     {
         bool wantSub = (kind == 1);
         size_t first = emitOrder.length;
+        uint local = 0;               // POLS-local poly counter, reset per kind
         auto c = appender!(ubyte[]);
         c.put(cast(const(ubyte)[]) "FACE"[]); // patched to PTCH below if needed
         foreach (i, poly; obj.polygons)
@@ -192,6 +201,8 @@ ubyte[] buildLwo2(in Lwo2Object obj)
             putU2(c, cast(ushort)(poly.indices.length & 0x3FF)); // count | flags(0)
             foreach (idx; poly.indices)
                 putVX(c, idx);
+            polyToLocal[i] = local++;
+            polyIsPtch[i]  = wantSub;
             emitOrder ~= i;
         }
         if (emitOrder.length == first)
@@ -204,13 +215,17 @@ ubyte[] buildLwo2(in Lwo2Object obj)
     }
 
     // --- PTAG SURF: polygon -> surface tag --------------------------------
+    // Poly indices are POLS-LOCAL (per the LWO2 spec): FACE PTAG entries number
+    // 0..N-1, PTCH PTAG entries number 0..M-1 — each local to its own POLS
+    // chunk. (For a single-kind mesh there is one POLS chunk, so local == flat
+    // and the bytes are identical to a flat numbering.)
     if (obj.surfaces.length)
     {
         auto c = appender!(ubyte[]);
         c.put(cast(const(ubyte)[]) "SURF"[]);
-        foreach (seq, polyIdx; emitOrder)
+        foreach (polyIdx; emitOrder)
         {
-            putVX(c, cast(uint) seq);
+            putVX(c, polyToLocal[polyIdx]);
             putU2(c, cast(ushort) obj.polygons[polyIdx].surface);
         }
         putChunk(body_, "PTAG", c.data);

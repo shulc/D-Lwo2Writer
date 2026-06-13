@@ -20,10 +20,13 @@ import lwo2.writer;
 // Stage 1 — D-1 "empty ⇒ no chunks emitted" byte-identity guard.
 //
 // An Lwo2Object with vmaps/vmads empty (the default after adding the new
-// fields) must produce EXACTLY the pre-change writer bytes — no VMAP/VMAD
-// chunk, identical length. The golden buffer below was captured from the
-// writer BEFORE the carrier fields were added (the existing inline quad+tri
-// sample), so this asserts the new fields are wholly inert.
+// fields) must produce EXACTLY the expected writer bytes — no VMAP/VMAD chunk,
+// identical length — so this asserts the new carrier fields are wholly inert.
+//
+// The golden buffer was originally captured from the writer before the carrier
+// fields existed (the inline quad+tri sample) and is UPDATED for the Stage 2.5
+// PTAG conformance fix (one byte: the PTCH entry's PTAG poly index is now
+// POLS-local 0, not the flat cross-POLS sequence 1). See Stage 2.5 tests below.
 // ---------------------------------------------------------------------------
 unittest
 {
@@ -44,8 +47,11 @@ unittest
 
     auto bytes = buildLwo2(obj);
 
-    // Pre-change golden output of the same object (captured from the writer
-    // before vmaps/vmads existed). Byte-identical == empty maps emit nothing.
+    // Golden output of the same object. Byte-identical == empty maps emit
+    // nothing. UPDATED for the Stage 2.5 PTAG conformance fix: the PTCH poly's
+    // PTAG poly index is now POLS-LOCAL (0), not the flat cross-POLS sequence
+    // (1). The single changed byte is in the PTAG SURF body — the PTCH entry's
+    // VX, "0,1" (flat seq=1) is now "0,0" (local index 0 within the PTCH POLS).
     static immutable ubyte[] golden = [
         70,79,82,77,0,0,1,124,76,87,79,50,76,65,89,82,0,0,0,18,0,0,0,0,0,0,0,0,
         0,0,0,0,0,0,0,0,0,0,84,65,71,83,0,0,0,12,66,111,100,121,0,0,82,111,111,
@@ -54,7 +60,7 @@ unittest
         0,64,0,0,0,0,0,0,0,66,66,79,88,0,0,0,24,0,0,0,0,0,0,0,0,0,0,0,0,63,128,
         0,0,64,0,0,0,0,0,0,0,80,79,76,83,0,0,0,14,70,65,67,69,0,4,0,0,0,1,0,2,0,
         3,80,79,76,83,0,0,0,12,80,84,67,72,0,3,0,3,0,2,0,4,80,84,65,71,0,0,0,12,
-        83,85,82,70,0,0,0,0,0,1,0,1,83,85,82,70,0,0,0,76,66,111,100,121,0,0,0,0,
+        83,85,82,70,0,0,0,0,0,0,0,1,83,85,82,70,0,0,0,76,66,111,100,121,0,0,0,0,
         67,79,76,82,0,14,63,51,51,51,63,51,51,51,63,51,51,51,0,0,68,73,70,70,0,6,
         63,128,0,0,0,0,83,80,69,67,0,6,0,0,0,0,0,0,71,76,79,83,0,6,62,204,204,
         205,0,0,84,82,65,78,0,6,0,0,0,0,0,0,83,85,82,70,0,0,0,76,82,111,111,102,
@@ -117,4 +123,143 @@ unittest
     obj.vmads ~= vmad;
     assert(obj.vmaps.length == 1);
     assert(obj.vmads.length == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: locate the body of the first top-level chunk with `id`. Returns the
+// slice of `bytes` covering exactly the chunk body (length = the u4 length
+// field), or null if not found. Walks the FORM payload chunk-by-chunk so it is
+// robust to chunk contents that happen to contain the id bytes.
+// ---------------------------------------------------------------------------
+version(unittest)
+private const(ubyte)[] chunkBody(const(ubyte)[] bytes, string id)
+{
+    // bytes[0..4]="FORM", [4..8]=u4 len, [8..12]="LWO2", then chunks.
+    size_t p = 12;
+    while (p + 8 <= bytes.length)
+    {
+        auto cid = bytes[p .. p + 4];
+        uint len = (bytes[p + 4] << 24) | (bytes[p + 5] << 16)
+                 | (bytes[p + 6] << 8)  | bytes[p + 7];
+        size_t bodyStart = p + 8;
+        if (bodyStart + len > bytes.length) break;
+        if (cid == cast(const(ubyte)[]) id)
+            return bytes[bodyStart .. bodyStart + len];
+        p = bodyStart + len + (len & 1); // even pad not counted in len
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2.5 — BLOCKER 2 regression guard: PTAG poly indices are POLS-LOCAL.
+//
+// For a MIXED FACE+PTCH mesh the PTCH polygon lands in its own (second) POLS
+// chunk, so its PTAG poly index must be 0 (local to that chunk), NOT the flat
+// cross-POLS position 1. This is the single byte that distinguishes the
+// conformance fix from the pre-fix flat numbering.
+// ---------------------------------------------------------------------------
+unittest
+{
+    Lwo2Object obj;
+    obj.points = [
+        [0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f], [0.5f, 2f, 0f]
+    ];
+    obj.surfaces = [
+        Lwo2Surface("Body"),
+        Lwo2Surface("Roof"),
+    ];
+    obj.polygons = [
+        Lwo2Polygon([0, 1, 2, 3], 0, false), // FACE — local index 0 in POLS#1
+        Lwo2Polygon([3, 2, 4], 1, true),     // PTCH — local index 0 in POLS#2
+    ];
+
+    auto bytes = buildLwo2(obj);
+    auto ptag  = chunkBody(bytes, "PTAG");
+    assert(ptag !is null, "PTAG chunk missing");
+
+    // PTAG body: "SURF" then per-poly (VX poly-index, U2 surface-index).
+    // Both polys here have a small index, so each VX is a 2-byte U2.
+    assert(ptag[0 .. 4] == cast(const(ubyte)[]) "SURF");
+    // Entry 0: FACE quad — VX poly index 0, surface 0.
+    ushort faceIdx = cast(ushort)((ptag[4] << 8) | ptag[5]);
+    ushort faceSrf = cast(ushort)((ptag[6] << 8) | ptag[7]);
+    assert(faceIdx == 0, "FACE PTAG poly index should be local 0");
+    assert(faceSrf == 0);
+    // Entry 1: PTCH tri — VX poly index 0 (POLS-LOCAL), surface 1.
+    // Pre-fix (flat numbering) this byte pair was 1; the fix makes it 0.
+    ushort ptchIdx = cast(ushort)((ptag[8] << 8) | ptag[9]);
+    ushort ptchSrf = cast(ushort)((ptag[10] << 8) | ptag[11]);
+    assert(ptchIdx == 0,
+           "BLOCKER 2: PTCH PTAG poly index must be POLS-LOCAL 0, not flat 1");
+    assert(ptchSrf == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2.5 — single-kind meshes are byte-UNCHANGED by the conformance fix.
+//
+// A pure-FACE (or pure-PTCH) mesh emits exactly one POLS chunk, so flat
+// numbering == POLS-local numbering and the PTAG bytes (and thus the whole
+// image) are identical to the pre-fix output. The goldens below were produced
+// by the writer; they verify the fix did not perturb the single-POLS path.
+// ---------------------------------------------------------------------------
+unittest
+{
+    // Pure-FACE: two quads, one surface. One POLS chunk ⇒ PTAG indices 0,1.
+    Lwo2Object obj;
+    obj.points = [
+        [0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f],
+        [2f, 0f, 0f], [2f, 1f, 0f]
+    ];
+    obj.surfaces = [ Lwo2Surface("Body") ];
+    obj.polygons = [
+        Lwo2Polygon([0, 1, 2, 3], 0, false),
+        Lwo2Polygon([1, 4, 5, 2], 0, false),
+    ];
+
+    auto bytes = buildLwo2(obj);
+    auto ptag  = chunkBody(bytes, "PTAG");
+    assert(ptag !is null && ptag[0 .. 4] == cast(const(ubyte)[]) "SURF");
+    // Sequential 0,1 — identical to flat numbering for a single POLS chunk.
+    assert(((ptag[4] << 8) | ptag[5]) == 0, "poly0 local index 0");
+    assert(((ptag[8] << 8) | ptag[9]) == 1, "poly1 local index 1");
+    // Exactly one POLS chunk exists (single-kind ⇒ flat == local).
+    size_t polsCount = 0;
+    for (size_t p = 12; p + 8 <= bytes.length; )
+    {
+        uint len = (bytes[p + 4] << 24) | (bytes[p + 5] << 16)
+                 | (bytes[p + 6] << 8)  | bytes[p + 7];
+        if (bytes[p .. p + 4] == cast(const(ubyte)[]) "POLS") polsCount++;
+        p += 8 + len + (len & 1);
+    }
+    assert(polsCount == 1, "pure-FACE mesh must emit exactly one POLS chunk");
+}
+
+unittest
+{
+    // Pure-PTCH: two subpatch quads, one surface. One POLS chunk ⇒ 0,1.
+    Lwo2Object obj;
+    obj.points = [
+        [0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f],
+        [2f, 0f, 0f], [2f, 1f, 0f]
+    ];
+    obj.surfaces = [ Lwo2Surface("Body") ];
+    obj.polygons = [
+        Lwo2Polygon([0, 1, 2, 3], 0, true),
+        Lwo2Polygon([1, 4, 5, 2], 0, true),
+    ];
+
+    auto bytes = buildLwo2(obj);
+    auto ptag  = chunkBody(bytes, "PTAG");
+    assert(ptag !is null && ptag[0 .. 4] == cast(const(ubyte)[]) "SURF");
+    assert(((ptag[4] << 8) | ptag[5]) == 0, "poly0 local index 0");
+    assert(((ptag[8] << 8) | ptag[9]) == 1, "poly1 local index 1");
+    size_t polsCount = 0;
+    for (size_t p = 12; p + 8 <= bytes.length; )
+    {
+        uint len = (bytes[p + 4] << 24) | (bytes[p + 5] << 16)
+                 | (bytes[p + 6] << 8)  | bytes[p + 7];
+        if (bytes[p .. p + 4] == cast(const(ubyte)[]) "POLS") polsCount++;
+        p += 8 + len + (len & 1);
+    }
+    assert(polsCount == 1, "pure-PTCH mesh must emit exactly one POLS chunk");
 }

@@ -38,6 +38,75 @@ references.
 
 Not yet emitted: image clips (CLIP), bones.
 
+## What it reads
+
+`readLwo2` / `readLwo2File` are the inverse of the writer: they parse an LWO2
+IFF image back into the same `Lwo2Object`, so `readLwo2(buildLwo2(obj))`
+round-trips field-for-field (and `buildLwo2(readLwo2(bytes))` is byte-identical).
+
+```
+FORM .. LWO2
+  LAYR            single layer (name; number/flags/pivot ignored)
+  TAGS            surface name table
+  PNTS            points
+  BBOX            skipped (recomputed from PNTS on write)
+  POLS FACE/PTCH  polygons; PTCH preserved as subpatch=true
+  PTAG SURF       polygon -> surface tag  (POLS-local index, remapped back)
+  VMAP .. (xN)    continuous per-point maps (e.g. UV / TXUV)
+  VMAD .. (xN)    per-corner maps, bound to their most-recent POLS chunk
+  SURF .. (xN)    COLR / DIFF / SPEC / GLOS / TRAN
+```
+
+On-disk PTAG and VMAD poly indices are **POLS-local** (0-based within the most
+recent `POLS` chunk of a kind); the reader remaps them back to natural
+`Lwo2Object.polygons[]` index space, so the carrier structs you read back never
+hold a POLS-local index. Unknown top-level chunks and curve POLS kinds are
+skipped by size; malformed or truncated input throws a typed `Lwo2ReadException`
+rather than corrupting state. Multi-layer is out of scope — geometry and
+surfaces accumulate into a single `Lwo2Object`.
+
+```d
+import lwo2;
+
+Lwo2Object obj = readLwo2File("quad.lwo");
+assert(obj.points.length > 0);
+foreach (p; obj.polygons)
+    if (p.subpatch) { /* a Catmull-Clark subpatch */ }
+```
+
+## Usage — UV maps (VMAP / VMAD)
+
+A **VMAP** is a continuous per-point map (one value tuple per point); a **VMAD**
+is a discontinuous per-corner map (one value tuple per `(point, polygon)` corner,
+overriding the VMAP at that corner). Both are sparse, dim-general parallel
+arrays; UV is `type = "TXUV"`, `dimension = 2`.
+
+```d
+import lwo2;
+
+Lwo2Object obj;
+obj.points   = [[0,0,0], [1,0,0], [1,1,0], [0,1,0]];
+obj.surfaces = [ Lwo2Surface("Body") ];
+obj.polygons = [ Lwo2Polygon([0, 1, 2, 3], /*surface*/ 0) ];
+
+// Continuous per-point UV.
+obj.vmaps ~= Lwo2VertexMap("TXUV", "Texture", 2,
+        /*points*/ [0u, 1u, 2u, 3u],
+        /*values*/ [0f,0f, 1f,0f, 1f,1f, 0f,1f]);
+
+// Per-corner override on one corner of polygon 0 (polys are in obj.polygons[]
+// index space — the writer/reader handle the POLS-local conversion).
+obj.vmads ~= Lwo2VertexMapD("TXUV", "Texture", 2,
+        /*points*/ [2u], /*polys*/ [0u], /*values*/ [0.9f, 0.9f]);
+
+auto bytes = buildLwo2(obj);
+
+// Read it back: UV is keyed in obj.polygons[] space on both sides.
+auto back = readLwo2(bytes);
+foreach (vm; back.vmaps) { /* vm.points[i] -> vm.values[i*vm.dimension .. ] */ }
+foreach (vd; back.vmads) { /* vd.polys[i] is an obj.polygons[] index */ }
+```
+
 ## Usage — core writer (no dependencies)
 
 ```d
@@ -94,9 +163,17 @@ polygon winding before calling.
 ## Build / test
 
 ```sh
-dub test --config=core      # dependency-free unit tests
+dub test --config=core      # dependency-free unit tests (reader + writer + UV)
 dub build --config=full     # writer + assimp adapter
+dub build                   # default config (full)
 ```
+
+The unit tests cover the writer, the reader, full write→read→write byte-identity,
+the UV (VMAP/VMAD) round-trip, and the format edges (VX 2-/4-byte boundary,
+even-pad, unknown-chunk skip, truncation). A small committed golden cube
+(`tests/fixtures/cube_uv.lwo`, embedded into the test via a string import) guards
+against silent writer drift; regenerate it with
+`rdmd -Isource tools/gen_cube_fixture.d` if the cube definition changes.
 
 ## License
 

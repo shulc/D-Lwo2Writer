@@ -3,16 +3,16 @@
 /// Pure D, no external dependencies (compiles under the `core` configuration).
 /// Parses an LWO2 IFF container into the same `Lwo2Object` the writer consumes,
 /// so a `readLwo2(buildLwo2(obj))` round-trips geometry, the PTCH subpatch flag,
-/// and surfaces. UV maps (VMAP/VMAD) are skipped at this stage; the chunk loop
-/// passes over them by their (even-padded) size, leaving `vmaps`/`vmads` empty.
+/// surfaces, and UV maps (VMAP/VMAD).
 ///
 /// The reader walks the top-level chunk list, validating the `FORM`/`LWO2`
 /// wrapper, advancing by each chunk's unpadded size plus the IFF even pad. It
 /// honours the LWO2 poly-index contract (the reader half of D-2): on-disk PTAG
-/// poly indices are POLS-LOCAL (0-based within the most-recent POLS chunk of a
-/// given kind), so the reader records, per POLS chunk it parses, the mapping
-/// `(kind, local) -> obj.polygons[] slot` and remaps PTAG entries back to
-/// `obj.polygons[]` index space before storing them.
+/// and VMAD poly indices are POLS-LOCAL (0-based within the most-recent POLS
+/// chunk of a given kind), so the reader records, per POLS chunk it parses, the
+/// mapping `(kind, local) -> obj.polygons[] slot` and remaps PTAG/VMAD entries
+/// back to `obj.polygons[]` index space before storing them. A VMAD binds to the
+/// most-recent POLS chunk (a VMAD with no preceding POLS is malformed).
 ///
 /// Tolerant: unknown top-level chunks and curve POLS kinds are skipped by size;
 /// malformed or truncated input throws a typed `Lwo2ReadException` rather than
@@ -23,7 +23,8 @@
 ///   https://docs.lightwave3d.com/2025/lightwave-object-format.html
 module lwo2.reader;
 
-import lwo2.writer : Lwo2Object, Lwo2Polygon, Lwo2Surface;
+import lwo2.writer : Lwo2Object, Lwo2Polygon, Lwo2Surface,
+                     Lwo2VertexMap, Lwo2VertexMapD;
 
 /// Thrown on malformed, truncated, or non-LWO2 input.
 class Lwo2ReadException : Exception
@@ -125,10 +126,14 @@ Lwo2Object readLwo2(const(ubyte)[] bytes)
             obj.surfaces ~= parseSurf(sub);
             break;
 
-        // VMAP/VMAD: parsed in Stage 4. Skipped here by size (the body sub is
-        // discarded; the outer cursor advances past it below).
         case "VMAP":
+            obj.vmaps ~= parseVmap(sub);
+            break;
+
         case "VMAD":
+            obj.vmads ~= parseVmad(sub, localToGlobal, lastPolsKind);
+            break;
+
         default:
             // Unknown chunks and curve POLS kinds (handled inside parsePols)
             // fall through and are skipped by size.
@@ -225,6 +230,74 @@ private void parsePtag(ref Cursor sub, ref Lwo2Object obj,
             throw new Lwo2ReadException("PTAG poly index out of range for its POLS");
         obj.polygons[map[local]].surface = tag;
     }
+}
+
+/// Parse a VMAP chunk (continuous per-point vertex map), the exact inverse of
+/// the writer's VMAP emit: ID4 type, U2 dimension, S0 name, then per entry
+/// `[VX point][F4 x dimension]` until the chunk body is consumed. The point
+/// index is stored verbatim (VMAP is POLS-independent — it carries explicit
+/// point indices into `Lwo2Object.points`).
+private Lwo2VertexMap parseVmap(ref Cursor sub)
+{
+    if (sub.remaining < 6)
+        throw new Lwo2ReadException("VMAP chunk too small for type + dimension");
+
+    Lwo2VertexMap vm;
+    vm.type      = sub.id4();
+    vm.dimension = sub.getU2();
+    vm.name      = sub.getS0();
+    if (vm.dimension == 0)
+        throw new Lwo2ReadException("VMAP has zero dimension");
+
+    // Each entry is one VX (>=2 bytes) plus `dimension` F4 values. Loop until
+    // the body is consumed; a short tail (< one entry) is malformed.
+    while (sub.remaining > 0)
+    {
+        uint point = sub.getVX();
+        vm.points ~= point;
+        foreach (d; 0 .. vm.dimension)
+            vm.values ~= sub.getF4();
+    }
+    return vm;
+}
+
+/// Parse a VMAD chunk (discontinuous per-corner vertex map), the inverse of the
+/// writer's VMAD emit: ID4 type, U2 dimension, S0 name, then per entry
+/// `[VX point][VX localPoly][F4 x dimension]` until the chunk body is consumed.
+/// A VMAD binds to the MOST-RECENT POLS chunk, so each on-disk `localPoly` is
+/// POLS-LOCAL to `lastPolsKind`; it is mapped through
+/// `localToGlobal[lastPolsKind][localPoly]` to an `obj.polygons[]`-space index
+/// (the D-2 reader half) before being stored in `polys[]`. Throws if no POLS
+/// preceded the VMAD (mirrors the spec's "VMAD binds to most-recent POLS"), or
+/// if a `localPoly` is out of range for that POLS chunk.
+private Lwo2VertexMapD parseVmad(ref Cursor sub,
+                                 ref size_t[][2] localToGlobal, ref int lastPolsKind)
+{
+    if (sub.remaining < 6)
+        throw new Lwo2ReadException("VMAD chunk too small for type + dimension");
+    if (lastPolsKind < 0)
+        throw new Lwo2ReadException("VMAD with no preceding POLS chunk");
+
+    Lwo2VertexMapD vmad;
+    vmad.type      = sub.id4();
+    vmad.dimension = sub.getU2();
+    vmad.name      = sub.getS0();
+    if (vmad.dimension == 0)
+        throw new Lwo2ReadException("VMAD has zero dimension");
+
+    auto map = localToGlobal[lastPolsKind];
+    while (sub.remaining > 0)
+    {
+        uint point     = sub.getVX();
+        uint localPoly = sub.getVX();
+        if (localPoly >= map.length)
+            throw new Lwo2ReadException("VMAD poly index out of range for its POLS");
+        vmad.points ~= point;
+        vmad.polys  ~= cast(uint) map[localPoly]; // POLS-local -> obj.polygons[]
+        foreach (d; 0 .. vmad.dimension)
+            vmad.values ~= sub.getF4();
+    }
+    return vmad;
 }
 
 /// Parse a SURF chunk into an `Lwo2Surface`, mirroring what `buildLwo2` writes:

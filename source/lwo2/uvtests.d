@@ -580,3 +580,318 @@ unittest
     assert(vmadBody !is null);
     assert(vmadBody[0 .. 4] == cast(const(ubyte)[]) "TXUV");
 }
+
+// ===========================================================================
+// Stage 4 — UV read: parse VMAP + VMAD.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Inline IFF byte-emit primitives — DELIBERATELY independent of writer.d's
+// private put* helpers. The hand-authored byte fixture below is built with
+// these (not via buildLwo2), so a shared wrong poly-index model in the
+// writer+reader cannot make the fixture pass.
+// ---------------------------------------------------------------------------
+version(unittest)
+private struct Bld
+{
+    ubyte[] b;
+
+    void u2(ushort v) { b ~= cast(ubyte)(v >> 8); b ~= cast(ubyte)(v & 0xFF); }
+    void u4(uint v)
+    {
+        b ~= cast(ubyte)(v >> 24); b ~= cast(ubyte)(v >> 16);
+        b ~= cast(ubyte)(v >> 8);  b ~= cast(ubyte)(v & 0xFF);
+    }
+    void f4(float v) @trusted { u4(*cast(uint*) &v); }
+    void id4(string s) { assert(s.length == 4); b ~= cast(const(ubyte)[]) s; }
+    /// VX (small index only — the hand fixture uses indices < 0xFF00).
+    void vx(uint idx) { assert(idx < 0xFF00); u2(cast(ushort) idx); }
+    /// S0: NUL-terminated, even-padded.
+    void s0(string s)
+    {
+        b ~= cast(const(ubyte)[]) s;
+        b ~= cast(ubyte) 0;
+        if (s.length % 2 == 0) b ~= cast(ubyte) 0; // chars+NUL odd -> 1 pad byte
+    }
+}
+
+/// Wrap a chunk body in `[ID4 id][u4 len][body][even pad]`, append to `out_`.
+version(unittest)
+private void emitChunk(ref ubyte[] out_, string id, const(ubyte)[] body_)
+{
+    assert(id.length == 4);
+    out_ ~= cast(const(ubyte)[]) id;
+    Bld h; h.u4(cast(uint) body_.length);
+    out_ ~= h.b;
+    out_ ~= body_;
+    if (body_.length & 1) out_ ~= cast(ubyte) 0; // even pad, not counted in len
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4 — HAND-AUTHORED BYTE FIXTURE (the BLOCKER-1/2 guard).
+//
+// This is the single authoritative test that the POLS-local poly-index model
+// is correct, because it is constructed BY HAND (not via buildLwo2). A writer
+// and reader that share the same wrong index space would agree on a generated
+// round-trip; only an independently-authored buffer with a hand-computed
+// expected mapping can catch that.
+//
+// Layout authored below (one layer):
+//   PNTS    : 5 points p0..p4.
+//   TAGS    : 2 surfaces  -> tag 0 = "FaceSurf", tag 1 = "PatchSurf".
+//   POLS FACE: 2 FACE polys                  (POLS-local 0, 1)
+//                local 0 = [0,1,2]  -> obj.polygons[0]
+//                local 1 = [0,2,3]  -> obj.polygons[1]
+//   POLS PTCH: 1 PTCH poly                   (POLS-local 0)
+//                local 0 = [0,3,4]  -> obj.polygons[2]   (subpatch=true)
+//   PTAG SURF: FACE local 0 -> tag 0, FACE local 1 -> tag 0,
+//              PTCH local 0 -> tag 1   <-- PTCH PTAG poly index = 0 (LOCAL)
+//   VMAD TXUV: one entry on PTCH local 0     <-- VMAD poly index = 0 (LOCAL)
+//
+// EXPECTED MAPPING (authored by hand):
+//   - The PTCH poly is the LAST polygon appended, so it lands at
+//     obj.polygons[2], NOT obj.polygons[0]. Its POLS-local index (0) must be
+//     remapped through localToGlobal[PTCH] to slot 2.
+//   - The PTAG PTCH entry (local 0) must therefore set obj.polygons[2].surface
+//     = 1 (PatchSurf). A FLAT-INDEX reader would wrongly assign tag 1 to
+//     obj.polygons[0] (the first FACE) — so this proves the remap, not a
+//     flat-index coincidence (slot 2 != local 0).
+//   - The VMAD (local 0) must attach to that SAME obj.polygons[2].
+// ---------------------------------------------------------------------------
+unittest
+{
+    // --- PNTS body: 5 points (f4 x3 each) ---------------------------------
+    Bld pnts;
+    pnts.f4(0); pnts.f4(0); pnts.f4(0);   // p0
+    pnts.f4(1); pnts.f4(0); pnts.f4(0);   // p1
+    pnts.f4(1); pnts.f4(1); pnts.f4(0);   // p2
+    pnts.f4(0); pnts.f4(1); pnts.f4(0);   // p3
+    pnts.f4(0); pnts.f4(2); pnts.f4(0);   // p4
+
+    // --- TAGS body: two surface names -------------------------------------
+    Bld tags;
+    tags.s0("FaceSurf");   // tag 0 (8 chars -> +NUL=9 odd -> 1 pad)
+    tags.s0("PatchSurf");  // tag 1 (9 chars -> +NUL=10 even -> 0 pad)
+
+    // --- POLS FACE body: "FACE" + 2 polys ---------------------------------
+    Bld polsFace;
+    polsFace.id4("FACE");
+    polsFace.u2(3); polsFace.vx(0); polsFace.vx(1); polsFace.vx(2); // local 0
+    polsFace.u2(3); polsFace.vx(0); polsFace.vx(2); polsFace.vx(3); // local 1
+
+    // --- POLS PTCH body: "PTCH" + 1 poly ----------------------------------
+    Bld polsPtch;
+    polsPtch.id4("PTCH");
+    polsPtch.u2(3); polsPtch.vx(0); polsPtch.vx(3); polsPtch.vx(4); // local 0
+
+    // --- PTAG SURF body: "SURF" + per-entry (VX localPoly, U2 tag) ---------
+    // The PTAG that follows the PTCH POLS binds to the PTCH chunk; its single
+    // entry's poly index is POLS-LOCAL 0. We also tag the two FACE polys, but
+    // a single PTAG binds to ONE POLS chunk, so we emit a PTAG after the FACE
+    // POLS (FACE locals) and a PTAG after the PTCH POLS (PTCH local). The
+    // reader binds each PTAG to the most-recent POLS — exactly like VMAD.
+    Bld ptagFace;
+    ptagFace.id4("SURF");
+    ptagFace.vx(0); ptagFace.u2(0);   // FACE local 0 -> tag 0 (FaceSurf)
+    ptagFace.vx(1); ptagFace.u2(0);   // FACE local 1 -> tag 0 (FaceSurf)
+
+    Bld ptagPtch;
+    ptagPtch.id4("SURF");
+    ptagPtch.vx(0); ptagPtch.u2(1);   // PTCH local 0 -> tag 1 (PatchSurf)
+
+    // --- VMAD TXUV body: type + dim + name + (VX point, VX localPoly, f4xdim)
+    Bld vmad;
+    vmad.id4("TXUV");
+    vmad.u2(2);                        // dimension
+    vmad.s0("UV");                     // name (2 chars -> +NUL=3 odd -> 1 pad)
+    vmad.vx(4);                        // point index 4 (a corner of the PTCH)
+    vmad.vx(0);                        // POLS-LOCAL poly index 0 (the PTCH poly)
+    vmad.f4(0.5f); vmad.f4(0.25f);     // the UV value
+
+    // --- SURF bodies (minimal: name + empty parent) -----------------------
+    Bld surf0; surf0.s0("FaceSurf");  surf0.s0("");
+    Bld surf1; surf1.s0("PatchSurf"); surf1.s0("");
+
+    // --- LAYR body (compact LWO2): u2 number, u2 flags, f4x3 pivot, S0 name -
+    Bld layr;
+    layr.u2(0); layr.u2(0);
+    layr.f4(0); layr.f4(0); layr.f4(0);
+    layr.s0("");
+
+    // --- Assemble the chunk stream. The PTAG/VMAD for the PTCH bind to the
+    //     PTCH POLS, so they must follow it (most-recent-POLS rule). Order:
+    //       LAYR, TAGS, PNTS, POLS FACE, PTAG(FACE), POLS PTCH, PTAG(PTCH),
+    //       VMAD(PTCH), SURF, SURF.
+    ubyte[] payload;
+    emitChunk(payload, "LAYR", layr.b);
+    emitChunk(payload, "TAGS", tags.b);
+    emitChunk(payload, "PNTS", pnts.b);
+    emitChunk(payload, "POLS", polsFace.b);
+    emitChunk(payload, "PTAG", ptagFace.b);
+    emitChunk(payload, "POLS", polsPtch.b);
+    emitChunk(payload, "PTAG", ptagPtch.b);
+    emitChunk(payload, "VMAD", vmad.b);
+    emitChunk(payload, "SURF", surf0.b);
+    emitChunk(payload, "SURF", surf1.b);
+
+    // --- FORM/LWO2 wrapper: "FORM" + u4(4 + payload) + "LWO2" + payload ----
+    ubyte[] file;
+    file ~= cast(const(ubyte)[]) "FORM";
+    Bld len; len.u4(cast(uint)(4 + payload.length));
+    file ~= len.b;
+    file ~= cast(const(ubyte)[]) "LWO2";
+    file ~= payload;
+    assert(file.length % 2 == 0, "hand-authored IFF image must be even-length");
+
+    // --- READ + assert the HAND-AUTHORED expected mapping -----------------
+    auto obj = readLwo2(file);
+
+    // Geometry: 3 polys total, in append order FACE,FACE,PTCH.
+    assert(obj.points.length == 5, "5 points expected");
+    assert(obj.polygons.length == 3, "2 FACE + 1 PTCH = 3 polygons");
+    assert(obj.polygons[0].indices == [0u, 1u, 2u]);
+    assert(obj.polygons[1].indices == [0u, 2u, 3u]);
+    assert(obj.polygons[2].indices == [0u, 3u, 4u]);
+
+    // (a) The PTCH poly landed at obj.polygons[2] with subpatch=true.
+    assert(!obj.polygons[0].subpatch, "FACE poly 0 must not be subpatch");
+    assert(!obj.polygons[1].subpatch, "FACE poly 1 must not be subpatch");
+    assert(obj.polygons[2].subpatch,
+           "the PTCH poly must land at obj.polygons[2] with subpatch=true");
+
+    // (b) The surface assignment proves the LOCAL->GLOBAL remap (not a flat
+    //     coincidence): the PTCH PTAG entry's LOCAL index 0 maps to GLOBAL
+    //     slot 2. A flat-index reader would have put tag 1 on slot 0.
+    assert(obj.polygons[0].surface == 0, "FACE poly 0 -> FaceSurf (tag 0)");
+    assert(obj.polygons[1].surface == 0, "FACE poly 1 -> FaceSurf (tag 0)");
+    assert(obj.polygons[2].surface == 1,
+           "BLOCKER 1/2: PTCH PTAG local 0 must remap to obj.polygons[2] "
+           ~ "(PatchSurf, tag 1), NOT flat slot 0");
+    // The surface table itself round-trips its names.
+    assert(obj.surfaces.length == 2);
+    assert(obj.surfaces[0].name == "FaceSurf");
+    assert(obj.surfaces[1].name == "PatchSurf");
+
+    // (c) The VMAD UV attaches to the SAME obj.polygons[2] poly. Its on-disk
+    //     poly index was POLS-LOCAL 0; it must read back as obj.polygons[]
+    //     slot 2 — the load-bearing D-2 reader-half remap.
+    assert(obj.vmads.length == 1, "one VMAD expected");
+    assert(obj.vmads[0].type == "TXUV");
+    assert(obj.vmads[0].name == "UV");
+    assert(obj.vmads[0].dimension == 2);
+    assert(obj.vmads[0].points == [4u], "VMAD point index round-trip");
+    assert(obj.vmads[0].polys == [2u],
+           "BLOCKER 1/2: VMAD local poly 0 must remap to obj.polygons[2], "
+           ~ "NOT flat slot 0");
+    assert(obj.vmads[0].values == [0.5f, 0.25f], "VMAD UV value round-trip");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4 — write -> read field-equality round-trip of a FULL object, plus
+// write -> read -> write BYTE-IDENTITY (the strongest self-consistency check).
+//
+// Exercises every emitted chunk: LAYR/TAGS/PNTS/BBOX/POLS FACE+PTCH/PTAG/SURF
+// and crucially a MULTI-CHANNEL VMAP (two named TXUV maps) and TWO VMADs —
+// one on a FACE poly, one on a PTCH poly — so the per-kind local<->global
+// remap is exercised on BOTH kinds (single-kind constraint: each VMAD's polys
+// all share one kind). All UV/PTAG state is keyed in obj.polygons[] space on
+// both sides of the round-trip.
+// ---------------------------------------------------------------------------
+unittest
+{
+    Lwo2Object obj;
+    obj.layerName = "Main";
+    obj.points = [
+        [0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f], [0.5f, 2f, 0f]
+    ];
+    obj.surfaces = [
+        Lwo2Surface("Body", [0.8f, 0.1f, 0.1f], 0.9f, 0.2f, 0.6f, 1.0f),
+        Lwo2Surface("Roof", [0.1f, 0.1f, 0.8f], 1.0f, 0.5f, 0.3f, 0.4f),
+    ];
+    obj.polygons = [
+        Lwo2Polygon([0, 1, 2, 3], 0, false), // obj.polygons[0]  FACE
+        Lwo2Polygon([3, 2, 4],    1, true),  // obj.polygons[1]  PTCH
+    ];
+
+    // Multi-channel VMAP: two named TXUV maps over the points.
+    Lwo2VertexMap uv0;
+    uv0.type = "TXUV"; uv0.name = "UVChannel0"; uv0.dimension = 2;
+    uv0.points = [0u, 1u, 2u, 3u];
+    uv0.values = [0f,0f, 1f,0f, 1f,1f, 0f,1f];
+    Lwo2VertexMap uv1;
+    uv1.type = "TXUV"; uv1.name = "UVChannel1"; uv1.dimension = 2;
+    uv1.points = [2u, 3u, 4u];
+    uv1.values = [0.2f,0.3f, 0.4f,0.5f, 0.6f,0.7f];
+    obj.vmaps = [uv0, uv1];
+
+    // Two VMADs, one per kind. FACE VMAD binds obj.polygons[0] (FACE); PTCH
+    // VMAD binds obj.polygons[1] (PTCH). Each is single-kind.
+    Lwo2VertexMapD faceVmad;
+    faceVmad.type = "TXUV"; faceVmad.name = "FaceCorners"; faceVmad.dimension = 2;
+    faceVmad.points = [0u, 2u]; faceVmad.polys = [0u, 0u];
+    faceVmad.values = [0.11f,0.12f, 0.13f,0.14f];
+    Lwo2VertexMapD ptchVmad;
+    ptchVmad.type = "TXUV"; ptchVmad.name = "PatchCorners"; ptchVmad.dimension = 2;
+    ptchVmad.points = [4u]; ptchVmad.polys = [1u];
+    ptchVmad.values = [0.91f, 0.92f];
+    obj.vmads = [faceVmad, ptchVmad];
+
+    auto bytes = buildLwo2(obj);
+    auto back  = readLwo2(bytes);
+
+    // --- field-by-field equality ------------------------------------------
+    assert(back.layerName == obj.layerName);
+
+    assert(back.points.length == obj.points.length);
+    foreach (i; 0 .. obj.points.length)
+        assert(back.points[i] == obj.points[i], "point changed");
+
+    assert(back.polygons.length == obj.polygons.length);
+    foreach (i; 0 .. obj.polygons.length)
+    {
+        assert(back.polygons[i].indices  == obj.polygons[i].indices);
+        assert(back.polygons[i].subpatch == obj.polygons[i].subpatch);
+        assert(back.polygons[i].surface  == obj.polygons[i].surface);
+    }
+
+    // VMAP: two channels, equal field-by-field (order preserved by the writer).
+    assert(back.vmaps.length == 2, "two VMAP channels expected");
+    foreach (i; 0 .. 2)
+    {
+        assert(back.vmaps[i].type      == obj.vmaps[i].type);
+        assert(back.vmaps[i].name      == obj.vmaps[i].name);
+        assert(back.vmaps[i].dimension == obj.vmaps[i].dimension);
+        assert(back.vmaps[i].points    == obj.vmaps[i].points);
+        assert(back.vmaps[i].values    == obj.vmaps[i].values,
+               "VMAP values changed in round-trip");
+    }
+
+    // VMAD: two per-kind maps, polys keyed in obj.polygons[] space both sides.
+    // The writer emits FACE-kind VMADs after the FACE POLS, then PTCH-kind
+    // after the PTCH POLS — same order as authored here (face then ptch).
+    assert(back.vmads.length == 2, "two VMADs expected (one per kind)");
+    foreach (i; 0 .. 2)
+    {
+        assert(back.vmads[i].type      == obj.vmads[i].type);
+        assert(back.vmads[i].name      == obj.vmads[i].name);
+        assert(back.vmads[i].dimension == obj.vmads[i].dimension);
+        assert(back.vmads[i].points    == obj.vmads[i].points);
+        assert(back.vmads[i].polys     == obj.vmads[i].polys,
+               "VMAD polys changed (local<->global remap broken?)");
+        assert(back.vmads[i].values    == obj.vmads[i].values,
+               "VMAD values changed in round-trip");
+    }
+    // Explicit: the FACE VMAD binds the FACE poly (slot 0), the PTCH VMAD the
+    // PTCH poly (slot 1) — exercising the remap on BOTH kinds.
+    assert(back.vmads[0].polys == [0u, 0u], "FACE VMAD -> obj.polygons[0]");
+    assert(back.vmads[1].polys == [1u],     "PTCH VMAD -> obj.polygons[1]");
+
+    // --- write -> read -> write BYTE-IDENTITY -----------------------------
+    // POLS-local stays on disk; both directions agree, so re-serializing the
+    // read-back object reproduces the original bytes exactly.
+    auto bytes2 = buildLwo2(back);
+    assert(bytes2.length == bytes.length,
+           "write->read->write image length changed");
+    assert(bytes2 == bytes,
+           "write->read->write is not byte-identical (UV remap not inverse?)");
+}

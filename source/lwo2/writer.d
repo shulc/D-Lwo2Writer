@@ -60,6 +60,50 @@ struct Lwo2Polygon
     bool   subpatch = false;
 }
 
+/// A continuous, per-point vertex map (VMAP). One value tuple per point.
+///
+/// Sparse and dim-general: `points[i]` is a point index into
+/// `Lwo2Object.points`, and its `dimension` floats are
+/// `values[i*dimension .. (i+1)*dimension]` (row-major). UV is `type = "TXUV"`,
+/// `dimension = 2`. Parallel arrays (not an assoc array) so emission order is
+/// deterministic and the map round-trips byte-for-byte.
+struct Lwo2VertexMap
+{
+    /// ID4 map type (e.g. "TXUV" for UV).
+    string  type = "TXUV";
+    /// Map channel name.
+    string  name;
+    /// Floats per entry (UV = 2).
+    uint    dimension = 2;
+    /// Point indices, length N (into `Lwo2Object.points`).
+    uint[]  points;
+    /// Per-entry values, length N * dimension, row-major.
+    float[] values;
+}
+
+/// A discontinuous, per-corner vertex map (VMAD). One value tuple per
+/// (point, polygon) corner — overrides the continuous VMAP at that corner.
+///
+/// `polys[i]` is in NATURAL `Lwo2Object.polygons[]` index space (the stable
+/// space a caller already has). POLS-local poly indices live on disk only: the
+/// writer remaps to POLS-local on emit and the reader remaps back on parse, so
+/// this struct never carries a POLS-local index.
+struct Lwo2VertexMapD
+{
+    /// ID4 map type (e.g. "TXUV" for UV).
+    string  type = "TXUV";
+    /// Map channel name.
+    string  name;
+    /// Floats per entry (UV = 2).
+    uint    dimension = 2;
+    /// Point indices, length M (into `Lwo2Object.points`).
+    uint[]  points;
+    /// Polygon indices, length M (into `Lwo2Object.polygons`).
+    uint[]  polys;
+    /// Per-entry values, length M * dimension, row-major.
+    float[] values;
+}
+
 /// A single-layer LWO2 object: points, polygons and the surfaces they use.
 struct Lwo2Object
 {
@@ -72,6 +116,10 @@ struct Lwo2Object
     Lwo2Surface[] surfaces;
     /// Optional layer name (LAYR).
     string        layerName = "";
+    /// Continuous per-point vertex maps (VMAP). Empty ⇒ no VMAP chunks emitted.
+    Lwo2VertexMap[]  vmaps;
+    /// Discontinuous per-corner vertex maps (VMAD). Empty ⇒ no VMAD chunks.
+    Lwo2VertexMapD[] vmads;
 }
 
 /// Serialize `obj` to an in-memory LWO2 file image.

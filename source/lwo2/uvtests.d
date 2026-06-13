@@ -15,6 +15,7 @@ module lwo2.uvtests;
 version(unittest):
 
 import lwo2.writer;
+import lwo2.reader;
 
 // ---------------------------------------------------------------------------
 // Stage 1 — D-1 "empty ⇒ no chunks emitted" byte-identity guard.
@@ -262,4 +263,156 @@ unittest
         p += 8 + len + (len & 1);
     }
     assert(polsCount == 1, "pure-PTCH mesh must emit exactly one POLS chunk");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 — write -> read round-trip of geometry + subpatch + surfaces.
+//
+// The mixed FACE+PTCH + 2-surface sample (the same one the writer's inline
+// unittest builds). buildLwo2 -> readLwo2 must reproduce points, polygons
+// (indices + count), the per-poly subpatch flag, the per-poly surface index,
+// and every SURF field. This is a valid assertion on a MIXED FACE+PTCH mesh
+// only because Stage 2.5 made PTAG POLS-local — the reader's localToGlobal
+// remap (D-2 reader half) maps the PTCH entry's local index 0 back to the
+// correct obj.polygons[] slot.
+// ---------------------------------------------------------------------------
+unittest
+{
+    Lwo2Object obj;
+    obj.points = [
+        [0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f], [0.5f, 2f, 0f]
+    ];
+    obj.surfaces = [
+        Lwo2Surface("Body", [0.8f, 0.1f, 0.1f], 0.9f, 0.2f, 0.6f, 1.0f),
+        Lwo2Surface("Roof", [0.1f, 0.1f, 0.8f], 1.0f, 0.5f, 0.3f, 0.4f),
+    ];
+    obj.polygons = [
+        Lwo2Polygon([0, 1, 2, 3], 0, false), // FACE quad, surface "Body"
+        Lwo2Polygon([3, 2, 4],    1, true),  // PTCH tri,  surface "Roof"
+    ];
+
+    auto bytes = buildLwo2(obj);
+    auto back  = readLwo2(bytes);
+
+    // Layer name (empty default).
+    assert(back.layerName == obj.layerName);
+
+    // Points.
+    assert(back.points.length == obj.points.length);
+    foreach (i; 0 .. obj.points.length)
+        foreach (a; 0 .. 3)
+            assert(back.points[i][a] == obj.points[i][a],
+                   "point coordinate changed in round-trip");
+
+    // Polygons: indices, count, subpatch flag, surface index — in the SAME
+    // order. The writer emits FACE-then-PTCH and the reader appends FACE-then-
+    // PTCH, so for this sample the order is preserved (quad then tri).
+    assert(back.polygons.length == obj.polygons.length);
+    foreach (i; 0 .. obj.polygons.length)
+    {
+        assert(back.polygons[i].indices == obj.polygons[i].indices,
+               "polygon vertex indices changed");
+        assert(back.polygons[i].subpatch == obj.polygons[i].subpatch,
+               "polygon subpatch flag changed");
+        assert(back.polygons[i].surface == obj.polygons[i].surface,
+               "polygon surface index changed (PTAG local->global remap?)");
+    }
+    // Explicit: the PTCH poly is poly 1, subpatch=true, surface=1 (Roof).
+    assert(back.polygons[1].subpatch);
+    assert(back.polygons[1].surface == 1);
+    assert(back.polygons[0].surface == 0);
+
+    // Surfaces: name + every SURF field round-trips.
+    assert(back.surfaces.length == obj.surfaces.length);
+    foreach (i; 0 .. obj.surfaces.length)
+    {
+        assert(back.surfaces[i].name        == obj.surfaces[i].name);
+        assert(back.surfaces[i].baseColor   == obj.surfaces[i].baseColor);
+        assert(back.surfaces[i].diffuse     == obj.surfaces[i].diffuse);
+        assert(back.surfaces[i].specular    == obj.surfaces[i].specular);
+        assert(back.surfaces[i].glossiness  == obj.surfaces[i].glossiness);
+        // opacity is stored on disk as TRAN = 1 - opacity, so the round-trip
+        // is opacity -> (1 - opacity) -> 1 - (1 - opacity). That double float
+        // subtraction is not bit-exact (e.g. 0.4 -> 0.6 -> 0.3999999762), so
+        // compare within a float epsilon — the reader faithfully inverts the
+        // on-disk TRAN; the tiny delta is the writer's TRAN representation.
+        import std.math : abs;
+        assert(abs(back.surfaces[i].opacity - obj.surfaces[i].opacity) < 1e-6f,
+               "opacity (1 - TRAN) changed beyond float epsilon in round-trip");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 — VX 4-byte-boundary: a poly that references a point index >= 0xFF00
+// is written in the 4-byte VX form and must read back exactly.
+//
+// Construct >0xFF00 points so the last point's index forces a 4-byte VX. The
+// big point list is irrelevant geometry — only the index encoding is under
+// test — but it must be present so the index is legal.
+// ---------------------------------------------------------------------------
+unittest
+{
+    enum size_t N = 0xFF00 + 4;    // 65284 points -> last index 65283 (>0xFF00)
+    Lwo2Object obj;
+    obj.points.length = N;
+    foreach (i; 0 .. N)
+        obj.points[i] = [cast(float) i, 0f, 0f];
+    obj.surfaces = [ Lwo2Surface("Body") ];
+    // One quad referencing two small indices and two >=0xFF00 indices so both
+    // the U2 and U4 VX forms appear in the same polygon.
+    uint hi0 = cast(uint)(N - 2);  // 65282
+    uint hi1 = cast(uint)(N - 1);  // 65283
+    obj.polygons = [ Lwo2Polygon([0u, 1u, hi0, hi1], 0, false) ];
+
+    auto bytes = buildLwo2(obj);
+    auto back  = readLwo2(bytes);
+
+    assert(back.points.length == N);
+    assert(back.polygons.length == 1);
+    assert(back.polygons[0].indices == [0u, 1u, hi0, hi1],
+           "VX 4-byte-boundary index round-trip mismatch");
+    // The high indices really are in the 4-byte VX range.
+    assert(hi0 >= 0xFF00 && hi1 >= 0xFF00);
+    // First and last points survive verbatim.
+    assert(back.points[0]      == [0f, 0f, 0f]);
+    assert(back.points[hi1][0] == cast(float) hi1);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 — even-pad: an odd-length S0 name (surface name + layer name) is
+// NUL-terminated and padded to an even byte count on write; the reader must
+// consume the pad and recover the exact name.
+//
+// "Body" has length 4 (even) -> name+NUL = 5 (odd) -> 1 pad byte.
+// "Roofy" has length 5 (odd)  -> name+NUL = 6 (even) -> 0 pad bytes.
+// Exercising both parities proves the reader's S0 pad accounting.
+// ---------------------------------------------------------------------------
+unittest
+{
+    Lwo2Object obj;
+    obj.layerName = "Lyr";         // length 3 (odd) -> name+NUL=4 (even), 0 pad
+    obj.points = [
+        [0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f], [0.5f, 2f, 0f]
+    ];
+    obj.surfaces = [
+        Lwo2Surface("Body"),       // even-length name  -> 1 pad byte
+        Lwo2Surface("Roofy"),      // odd-length name   -> 0 pad bytes
+    ];
+    obj.polygons = [
+        Lwo2Polygon([0, 1, 2, 3], 0, false),
+        Lwo2Polygon([3, 2, 4],    1, true),
+    ];
+
+    auto back = readLwo2(buildLwo2(obj));
+
+    assert(back.layerName == "Lyr", "odd-length layer name not recovered");
+    assert(back.surfaces.length == 2);
+    assert(back.surfaces[0].name == "Body",
+           "even-length surface name (with pad) not recovered exactly");
+    assert(back.surfaces[1].name == "Roofy",
+           "odd-length surface name (no pad) not recovered exactly");
+    // Geometry still intact alongside the padded names.
+    assert(back.points.length == 5);
+    assert(back.polygons.length == 2);
+    assert(back.polygons[1].subpatch);
 }

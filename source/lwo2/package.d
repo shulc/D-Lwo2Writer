@@ -6,3 +6,4 @@
 module lwo2;
 
 public import lwo2.writer;
+public import lwo2.reader;

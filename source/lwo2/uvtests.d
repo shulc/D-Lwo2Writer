@@ -1309,3 +1309,65 @@ unittest
     assert(throwsRead(cut),
            "chunk-overrun (declared size > remaining) must throw, not crash");
 }
+
+// ---------------------------------------------------------------------------
+// Multi-layer write -> read round-trip.
+//
+// Two layers (a quad at z=0 and a HIDDEN triangle at z=+5) sharing one global
+// surface table. After buildLwo2 -> readLwo2 the object must come back with two
+// layers, each carrying LAYER-LOCAL point indices (the triangle's poly indexes
+// 0,1,2 into its OWN three points, not offset past the quad's four), and the
+// hidden flag on layer 1 must round-trip.
+unittest
+{
+    Lwo2Object obj;
+    obj.surfaces = [Lwo2Surface("Body"), Lwo2Surface("Roof")];
+
+    Lwo2Layer quad;
+    quad.name     = "quad";
+    quad.points   = [[0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f], [0f, 1f, 0f]];
+    quad.polygons = [Lwo2Polygon([0, 1, 2, 3], 0, false)];
+
+    Lwo2Layer tri;
+    tri.name     = "tri";
+    tri.hidden   = true;
+    tri.points   = [[0f, 0f, 5f], [1f, 0f, 5f], [0.5f, 1f, 5f]];
+    tri.polygons = [Lwo2Polygon([0, 1, 2], 1, false)];
+
+    obj.layers = [quad, tri];
+
+    auto back = readLwo2(buildLwo2(obj));
+
+    assert(back.layers.length == 2, "two layers must round-trip");
+
+    // Layer 0: the quad, visible, four local points, indices 0..3.
+    assert(back.layers[0].name == "quad");
+    assert(!back.layers[0].hidden, "layer 0 must not be hidden");
+    assert(back.layers[0].points.length == 4);
+    assert(back.layers[0].polygons.length == 1);
+    assert(back.layers[0].polygons[0].indices == [0u, 1u, 2u, 3u],
+           "quad indices must be layer-local 0..3");
+    assert(back.layers[0].polygons[0].surface == 0, "quad surface tag");
+
+    // Layer 1: the triangle, HIDDEN, three local points, indices 0..2 — proving
+    // point indices are layer-local (NOT offset by layer 0's four points) and
+    // the hidden flag survived.
+    assert(back.layers[1].name == "tri");
+    assert(back.layers[1].hidden, "layer 1 hidden flag must round-trip");
+    assert(back.layers[1].points.length == 3);
+    assert(back.layers[1].points[0] == [0f, 0f, 5f],
+           "layer-1 points are this layer's own, at z=+5");
+    assert(back.layers[1].polygons.length == 1);
+    assert(back.layers[1].polygons[0].indices == [0u, 1u, 2u],
+           "triangle indices must be layer-local 0..2, not 4..6");
+    assert(back.layers[1].polygons[0].surface == 1, "triangle surface tag");
+
+    // Global surface table is shared (one table, both names present).
+    assert(back.surfaces.length == 2);
+    assert(back.surfaces[0].name == "Body");
+    assert(back.surfaces[1].name == "Roof");
+
+    // Back-compat mirror: the flat fields surface layer 0.
+    assert(back.points.length == 4 && back.layerName == "quad",
+           "flat fields mirror the first layer for single-layer callers");
+}

@@ -16,15 +16,23 @@
 ///
 /// Tolerant: unknown top-level chunks and curve POLS kinds are skipped by size;
 /// malformed or truncated input throws a typed `Lwo2ReadException` rather than
-/// corrupting state. Multi-layer is out of scope — geometry/surfaces accumulate
-/// into a single `Lwo2Object` (the writer emits one LAYR 0).
+/// corrupting state.
+///
+/// Multi-layer aware: each `LAYR` chunk opens a new layer; the geometry chunks
+/// that follow (PNTS/POLS/PTAG/VMAP/VMAD, with their POLS-local numbering reset
+/// per layer) accumulate into it, while TAGS/SURF are file-global. The parsed
+/// layers are returned in `Lwo2Object.layers`; the LAYR `flags` hidden bit is
+/// read back into `Lwo2Layer.hidden`. For back-compat the FIRST layer is also
+/// mirrored into the flat `Lwo2Object` fields (points/polygons/vmaps/vmads/
+/// layerName), so a single-layer `readLwo2(buildLwo2(flatObj))` round-trips
+/// through the flat fields exactly as before.
 ///
 /// Format reference:
 ///   https://docs.lightwave3d.com/2025/lightwave-object-format.html
 module lwo2.reader;
 
-import lwo2.writer : Lwo2Object, Lwo2Polygon, Lwo2Surface,
-                     Lwo2VertexMap, Lwo2VertexMapD;
+import lwo2.writer : Lwo2Object, Lwo2Layer, Lwo2Polygon, Lwo2Surface,
+                     Lwo2VertexMap, Lwo2VertexMapD, LAYR_FLAG_HIDDEN;
 
 /// Thrown on malformed, truncated, or non-LWO2 input.
 class Lwo2ReadException : Exception
@@ -54,14 +62,39 @@ Lwo2Object readLwo2(const(ubyte)[] bytes)
         throw new Lwo2ReadException("not an LWO2 file (wrong form type)");
 
     Lwo2Object obj;
-    string[] tags;                 // TAGS surface-name table (held until SURF)
+    Lwo2Layer[] layers;            // one per LAYR chunk seen, in file order
 
-    // Reader half of D-2: per-kind POLS-local -> obj.polygons[] slot. Indexed
-    // by POLS kind (0 = FACE, 1 = PTCH); each entry is the obj.polygons[] slot
-    // a poly was appended to, in on-disk POLS order. `lastPolsKind` records the
+    // The layer currently being filled. A LAYR chunk pushes the previous one (if
+    // any) and starts a fresh layer; geometry chunks before the first LAYR (rare,
+    // but tolerated) accumulate into an implicit layer 0 created on first use.
+    Lwo2Layer cur_;
+    bool haveLayer = false;        // has cur_ been opened by a LAYR (or geometry)?
+
+    // Reader half of D-2: per-kind POLS-local -> cur_.polygons[] slot, RESET per
+    // layer. Indexed by POLS kind (0 = FACE, 1 = PTCH); each entry is the slot a
+    // poly was appended to, in on-disk POLS order. `lastPolsKind` records the
     // kind of the most-recent POLS chunk so PTAG (and later VMAD) can bind.
     size_t[][2] localToGlobal;
-    int lastPolsKind = -1;         // -1 == no POLS seen yet
+    int lastPolsKind = -1;         // -1 == no POLS seen yet (in this layer)
+
+    void ensureLayer()
+    {
+        if (!haveLayer)
+            haveLayer = true;      // open the implicit current layer
+    }
+
+    void flushLayer()
+    {
+        if (haveLayer)
+        {
+            layers ~= cur_;
+            cur_ = Lwo2Layer.init;
+            localToGlobal[0] = null;
+            localToGlobal[1] = null;
+            lastPolsKind = -1;
+            haveLayer = false;
+        }
+    }
 
     // --- top-level chunk loop ---------------------------------------------
     while (cur.remaining >= 8)
@@ -81,20 +114,22 @@ Lwo2Object readLwo2(const(ubyte)[] bytes)
         case "LAYR":
             // COMPACT LWO2 LAYR: u2 number, u2 flags, f4x3 pivot, S0 name.
             // (No extended tail — this is the LWO2 form, not the LXO one.)
+            flushLayer();              // close the previous layer, start fresh
+            haveLayer = true;
             if (sub.remaining >= 2 + 2 + 12)
             {
-                sub.getU2();           // layer number (single layer 0; ignored)
-                sub.getU2();           // flags (ignored)
-                sub.getF4(); sub.getF4(); sub.getF4(); // pivot (ignored)
-                obj.layerName = sub.getS0();
+                sub.getU2();           // layer number (positional; ignored)
+                ushort flags = sub.getU2();
+                cur_.hidden = (flags & LAYR_FLAG_HIDDEN) != 0;
+                cur_.pivot = [sub.getF4(), sub.getF4(), sub.getF4()];
+                cur_.name = sub.getS0();
             }
             break;
 
         case "TAGS":
-            // Null-terminated, even-padded surface names, packed until the
-            // chunk is consumed.
-            while (sub.remaining > 0)
-                tags ~= sub.getS0();
+            // Null-terminated, even-padded surface names, packed until the chunk
+            // is consumed. GLOBAL — not part of any layer. (Names are recorded
+            // implicitly via the SURF parse order, matching the writer.)
             break;
 
         case "PNTS":
@@ -102,10 +137,11 @@ Lwo2Object readLwo2(const(ubyte)[] bytes)
             if (size % 12 != 0)
                 throw new Lwo2ReadException("PNTS size is not a multiple of 12");
             {
+                ensureLayer();
                 size_t n = size / 12;
-                obj.points.length = n;
+                cur_.points.length = n;
                 foreach (i; 0 .. n)
-                    obj.points[i] = [sub.getF4(), sub.getF4(), sub.getF4()];
+                    cur_.points[i] = [sub.getF4(), sub.getF4(), sub.getF4()];
             }
             break;
 
@@ -115,23 +151,27 @@ Lwo2Object readLwo2(const(ubyte)[] bytes)
             break;
 
         case "POLS":
-            parsePols(sub, obj, localToGlobal, lastPolsKind);
+            ensureLayer();
+            parsePols(sub, cur_, localToGlobal, lastPolsKind);
             break;
 
         case "PTAG":
-            parsePtag(sub, obj, localToGlobal, lastPolsKind);
+            ensureLayer();
+            parsePtag(sub, cur_, localToGlobal, lastPolsKind);
             break;
 
         case "SURF":
-            obj.surfaces ~= parseSurf(sub);
+            obj.surfaces ~= parseSurf(sub);   // GLOBAL surface table
             break;
 
         case "VMAP":
-            obj.vmaps ~= parseVmap(sub);
+            ensureLayer();
+            cur_.vmaps ~= parseVmap(sub);
             break;
 
         case "VMAD":
-            obj.vmads ~= parseVmad(sub, localToGlobal, lastPolsKind);
+            ensureLayer();
+            cur_.vmads ~= parseVmad(sub, localToGlobal, lastPolsKind);
             break;
 
         default:
@@ -146,6 +186,21 @@ Lwo2Object readLwo2(const(ubyte)[] bytes)
         cur.skip(size);
         if (size & 1)
             cur.skip(1);
+    }
+
+    flushLayer();                  // close the final layer
+    obj.layers = layers;
+
+    // Back-compat mirror: surface the first layer's geometry through the flat
+    // fields so existing single-layer callers (and the byte-for-byte round-trip
+    // tests) keep reading from obj.points/polygons/vmaps/vmads/layerName.
+    if (layers.length)
+    {
+        obj.points    = layers[0].points;
+        obj.polygons  = layers[0].polygons;
+        obj.vmaps     = layers[0].vmaps;
+        obj.vmads     = layers[0].vmads;
+        obj.layerName = layers[0].name;
     }
 
     return obj;
@@ -166,7 +221,7 @@ Lwo2Object readLwo2File(string path)
 /// FACE -> subpatch=false, PTCH -> subpatch=true; curve kinds are skipped (the
 /// whole chunk is consumed by reading to its end, but curve polys are NOT
 /// appended). Records the reader-half D-2 map for the supported kinds.
-private void parsePols(ref Cursor sub, ref Lwo2Object obj,
+private void parsePols(ref Cursor sub, ref Lwo2Layer obj,
                        ref size_t[][2] localToGlobal, ref int lastPolsKind)
 {
     if (sub.remaining < 4)
@@ -210,7 +265,7 @@ private void parsePols(ref Cursor sub, ref Lwo2Object obj,
 /// Parse a PTAG SURF chunk: ID4 type, then per-entry `[VX poly][u2 tag]`. The
 /// on-disk poly index is POLS-LOCAL to the most-recent POLS chunk; map it back
 /// to an obj.polygons[] slot via `localToGlobal[lastPolsKind]`.
-private void parsePtag(ref Cursor sub, ref Lwo2Object obj,
+private void parsePtag(ref Cursor sub, ref Lwo2Layer obj,
                        ref size_t[][2] localToGlobal, ref int lastPolsKind)
 {
     if (sub.remaining < 4)

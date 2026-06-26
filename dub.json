@@ -16,7 +16,7 @@
             "name": "full",
             "comment": "Writer + aiScene* adapter (lwo2.assimp). Pulls in bindbc-assimp6.",
             "dependencies": {
-                "bindbc-assimp6": { "version": "~master", "repository": "git+https://github.com/shulc/bindbc-assimp6.git" }
+                "bindbc-assimp6": { "version": "3b7c87431b12418a32e70cb065fc63fd6cc98b13", "repository": "git+https://github.com/shulc/bindbc-assimp6.git" }
             }
         },
         {

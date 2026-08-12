@@ -13,14 +13,17 @@
 ///     VMAP .. (xN)      -- continuous per-point vertex maps (e.g. UV/TXUV)
 ///     POLS FACE         -- ordinary polygons
 ///     VMAD .. (xN)      -- per-corner maps bound to the FACE polys above
+///     PTAG SURF         -- polygon -> surface tag for the FACE polys above
 ///     POLS PTCH         -- Catmull-Clark subpatches (only if any)
 ///     VMAD .. (xN)      -- per-corner maps bound to the PTCH polys above
-///     PTAG SURF         -- polygon -> surface tag
+///     PTAG SURF         -- polygon -> surface tag for the PTCH polys above
 ///     SURF .. (xN)      -- COLR / DIFF / SPEC / GLOS / TRAN
 ///
-/// A VMAD binds to the most-recent POLS chunk and uses POLS-local poly indices,
-/// so each VMAD is emitted immediately after the POLS chunk of the kind it
-/// references (each VMAD references exactly one kind).
+/// A VMAD — and likewise a PTAG — binds to the most-recent POLS chunk and uses
+/// POLS-local poly indices, so each is emitted immediately after the POLS
+/// chunk of the kind it references (each VMAD references exactly one kind; a
+/// mixed-kind layer gets one PTAG per kind, a single-kind layer's bytes are
+/// unchanged from the old single trailing PTAG).
 ///
 /// The surface model mirrors the fields a LightWave/Modo-style modeller keeps
 /// per material (base color + diffuse/specular/glossiness/opacity), so output
@@ -441,24 +444,29 @@ private void emitLayerBody(ref App body_, in Lwo2Layer layer, bool hasSurfaces)
             }
             putChunk(body_, "VMAD", c2.data);
         }
-    }
 
-    // --- PTAG SURF: polygon -> surface tag --------------------------------
-    // Poly indices are POLS-LOCAL (per the LWO2 spec): FACE PTAG entries number
-    // 0..N-1, PTCH PTAG entries number 0..M-1 — each local to its own POLS
-    // chunk. (For a single-kind mesh there is one POLS chunk, so local == flat
-    // and the bytes are identical to a flat numbering.) The `surface` index is
-    // into the GLOBAL surface table, shared across layers.
-    if (hasSurfaces)
-    {
-        auto c = appender!(ubyte[]);
-        c.put(cast(const(ubyte)[]) "SURF"[]);
-        foreach (polyIdx; emitOrder)
+        // --- PTAG SURF: polygon -> surface tag, for THIS kind -------------
+        // Poly indices are POLS-LOCAL, and a PTAG (like a VMAD) binds to the
+        // MOST-RECENT POLS chunk — so each kind's tags are emitted right
+        // after that kind's POLS chunk. A single trailing PTAG covering both
+        // kinds (the pre-fix layout) is inherently ambiguous: FACE and PTCH
+        // locals both number 0..K-1 and a PTAG entry carries no kind, so a
+        // conformant reader (this package's own `parsePtag` included) remaps
+        // every entry through the most-recent POLS and misassigns the earlier
+        // kind's tags. For a single-kind layer there is one POLS chunk and
+        // the bytes are identical to the old trailing emission. The `surface`
+        // index is into the GLOBAL surface table, shared across layers.
+        if (hasSurfaces)
         {
-            putVX(c, polyToLocal[polyIdx]);
-            putU2(c, cast(ushort) layer.polygons[polyIdx].surface);
+            auto c3 = appender!(ubyte[]);
+            c3.put(cast(const(ubyte)[]) "SURF"[]);
+            foreach (polyIdx; emitOrder[first .. $])
+            {
+                putVX(c3, polyToLocal[polyIdx]);
+                putU2(c3, cast(ushort) layer.polygons[polyIdx].surface);
+            }
+            putChunk(body_, "PTAG", c3.data);
         }
-        putChunk(body_, "PTAG", c.data);
     }
 }
 

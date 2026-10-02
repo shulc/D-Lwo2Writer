@@ -17,7 +17,7 @@
 ///     POLS PTCH         -- Catmull-Clark subpatches (only if any)
 ///     VMAD .. (xN)      -- per-corner maps bound to the PTCH polys above
 ///     PTAG SURF         -- polygon -> surface tag for the PTCH polys above
-///     SURF .. (xN)      -- COLR / DIFF / SPEC / GLOS / TRAN
+///     SURF .. (xN)      -- COLR / DIFF / SPEC / GLOS / [SMAN] / TRAN / [SIDE]
 ///
 /// A VMAD — and likewise a PTAG — binds to the most-recent POLS chunk and uses
 /// POLS-local poly indices, so each is emitted immediately after the POLS
@@ -56,6 +56,12 @@ struct Lwo2Surface
     float   glossiness = 0.4f;
     /// Opacity in [0, 1]; written as transparency TRAN = 1 - opacity.
     float   opacity = 1.0f;
+    /// Max smoothing angle in RADIANS (SMAN, a plain F4 with no envelope).
+    /// NaN (the default) = do not write SMAN, so existing output is unchanged.
+    /// 0 is written (a reader treats SMAN 0 as smoothing off).
+    float   smoothingAngle = float.nan;
+    /// Double-sided surface: SIDE = 3 is written iff true (absent = one-sided).
+    bool    doubleSided = false;
 }
 
 /// One polygon: ordered point indices, its surface, and FACE-vs-PTCH kind.
@@ -236,7 +242,21 @@ ubyte[] buildLwo2(in Lwo2Object obj)
         putF4SubChunk(c, "DIFF", s.diffuse);
         putF4SubChunk(c, "SPEC", s.specular);
         putF4SubChunk(c, "GLOS", s.glossiness);
+        // SMAN { max-smoothing-angle[ANG4] } -- no envelope.
+        if (s.smoothingAngle == s.smoothingAngle)   // !isNaN
+        {
+            auto sc = appender!(ubyte[]);
+            putF4(sc, s.smoothingAngle);
+            putSubChunk(c, "SMAN", sc.data);
+        }
         putF4SubChunk(c, "TRAN", 1.0f - s.opacity);
+        // SIDE { sidedness[U2] } -- 3 = front and back.
+        if (s.doubleSided)
+        {
+            auto sc = appender!(ubyte[]);
+            putU2(sc, 3);
+            putSubChunk(c, "SIDE", sc.data);
+        }
 
         putChunk(body_, "SURF", c.data);
     }
@@ -695,4 +715,63 @@ unittest
         pos = at + 4;
     }
     assert(seen == 2, "expected to locate two LAYR headers");
+}
+
+// SMAN / SIDE emission: absent by default (byte-identical output), SMAN a plain
+// F4 of size 4 when set (0 included), SIDE a U2 = 3 of size 2 iff doubleSided.
+unittest
+{
+    import std.algorithm.searching : countUntil;
+
+    static const(ubyte)[] surfBytes(Lwo2Surface s)
+    {
+        Lwo2Object obj;
+        obj.points = [[0f, 0f, 0f], [1f, 0f, 0f], [1f, 1f, 0f]];
+        obj.surfaces = [s];
+        obj.polygons = [Lwo2Polygon([0, 1, 2], 0, false)];
+        auto b = buildLwo2(obj);
+        immutable long at = countUntil(b, cast(const(ubyte)[]) "SURF");
+        assert(at >= 0);
+        return b[cast(size_t) at .. $];
+    }
+    static long find(const(ubyte)[] b, string id)
+    {
+        return countUntil(b, cast(const(ubyte)[]) id);
+    }
+    static ushort u2(const(ubyte)[] b, size_t at)
+    {
+        return cast(ushort)((b[at] << 8) | b[at + 1]);
+    }
+    static float f4(const(ubyte)[] b, size_t at)
+    {
+        uint u = (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3];
+        return *cast(float*) &u;
+    }
+
+    // Default: neither sub-chunk.
+    auto d = surfBytes(Lwo2Surface("A"));
+    assert(find(d, "SMAN") < 0 && find(d, "SIDE") < 0);
+
+    // SMAN set: size 4, value round-trips, written after GLOS and before TRAN.
+    Lwo2Surface s = Lwo2Surface("A");
+    s.smoothingAngle = 0.6981317f;
+    auto b = surfBytes(s);
+    immutable long sm = find(b, "SMAN");
+    assert(sm > find(b, "GLOS") && sm < find(b, "TRAN"));
+    assert(u2(b, cast(size_t) sm + 4) == 4);
+    assert(f4(b, cast(size_t) sm + 6) == 0.6981317f);
+
+    // SMAN 0 is written.
+    s.smoothingAngle = 0;
+    auto z = surfBytes(s);
+    immutable long z0 = find(z, "SMAN");
+    assert(z0 >= 0 && u2(z, cast(size_t) z0 + 4) == 4 && f4(z, cast(size_t) z0 + 6) == 0);
+
+    // SIDE iff doubleSided: size 2, value 3, after TRAN.
+    Lwo2Surface t = Lwo2Surface("A");
+    t.doubleSided = true;
+    auto e = surfBytes(t);
+    immutable long sd = find(e, "SIDE");
+    assert(sd > find(e, "TRAN"));
+    assert(u2(e, cast(size_t) sd + 4) == 2 && u2(e, cast(size_t) sd + 6) == 3);
 }
